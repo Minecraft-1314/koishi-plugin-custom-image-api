@@ -1,20 +1,19 @@
 import { Context, Schema, h, Session } from 'koishi'
-import axios from 'axios'
-import crypto from 'crypto'
+import axios, { AxiosInstance } from 'axios'
 import fs from 'fs'
 import path from 'path'
 import { pipeline } from 'stream/promises'
 import { isMainThread, Worker, workerData, parentPort } from 'worker_threads'
 
 type LocaleKey = 'zh-CN'
-type MessageKey = 
-  | 'messages.repeatRequest'
+type MessageKey =
   | 'messages.fetchFailed'
-  | 'messages.partialFailed'
-  | 'messages.allFailed'
+  | 'messages.fetchTimeout'
+  | 'messages.fetchNetworkError'
   | 'messages.fetchSuccess'
   | 'messages.fetchWaiting'
   | 'messages.inputError'
+  | 'messages.inputTooLong'
   | 'messages.cacheCleared'
   | 'commands.hsjp'
   | 'commands.dmjp'
@@ -22,13 +21,13 @@ type MessageKey =
 
 const locales: Record<LocaleKey, Record<MessageKey, string>> = {
   'zh-CN': {
-    'messages.repeatRequest': '请求过于频繁，请稍后再试',
     'messages.fetchFailed': '图片获取失败',
-    'messages.partialFailed': '部分图片获取失败：',
-    'messages.allFailed': '所有图片获取失败：',
+    'messages.fetchTimeout': '图片请求超时，请稍后再试',
+    'messages.fetchNetworkError': '网络连接失败，请检查网络',
     'messages.fetchSuccess': '图片获取成功！',
     'messages.fetchWaiting': '正在获取图片，请稍候...',
     'messages.inputError': '输入内容不能为空！',
+    'messages.inputTooLong': '输入内容过长，请控制在200字以内',
     'messages.cacheCleared': '✅ 图片缓存已清空',
     'commands.hsjp': '生成黑丝举牌图片',
     'commands.dmjp': '生成动漫举牌图片',
@@ -36,9 +35,14 @@ const locales: Record<LocaleKey, Record<MessageKey, string>> = {
   }
 }
 
-const currentFilePath = isMainThread 
-  ? __filename 
-  : path.join(process.cwd(), isMainThread ? 'src/index.ts' : 'lib/index.js');
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+const HSJP_API = 'https://api.suyanw.cn/api/hsjp/'
+const DMJP_API = 'https://api.suyanw.cn/api/dmjp.php'
+const IMAGE_URL_PATTERN = /^https?:\/\/.+\.(jpg|jpeg|png|gif|webp|bmp)(\?.*)?(#.*)?$/i
+const MAX_INPUT_LENGTH = 200
+const SUCCESS_DELAY_MS = 300
+const FALLBACK_MIME = 'image/jpeg'
+const DEFAULT_CACHE_MAX_AGE = 3600000
 
 export const name = 'custom-image-api'
 
@@ -68,122 +72,243 @@ export const Config: Schema<Config> = Schema.object({
   showTimeoutTip: Schema.boolean().default(true).description('API请求超时后给用户提示')
 })
 
+interface FetchResult {
+  success: boolean
+  type: 'url' | 'buffer' | ''
+  data: string | Buffer
+  timeout: boolean
+  networkError: boolean
+}
+
 if (!isMainThread) {
-  const { url, filePath } = workerData;
-  (async () => {
+  const { url, filePath } = workerData
+  ;(async () => {
     try {
-      const response = await axios({ url, method: 'GET', responseType: 'stream', timeout: 60000, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' } });
-      await pipeline(response.data, fs.createWriteStream(filePath));
-      parentPort?.postMessage({ success: true, filePath });
+      const response = await axios({
+        url,
+        method: 'GET',
+        responseType: 'stream',
+        timeout: 60000,
+        headers: { 'User-Agent': USER_AGENT }
+      })
+      await pipeline(response.data, fs.createWriteStream(filePath))
+      parentPort?.postMessage({ success: true, filePath })
     } catch (error) {
-      parentPort?.postMessage({ success: false, error: (error as Error).message });
+      parentPort?.postMessage({ success: false, error: (error as Error).message })
     }
-  })();
+  })()
 }
 
-const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
+const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
-function getI18nText(session: Session, key: MessageKey) {
+function getI18nText(session: Session | null, key: MessageKey): string {
   if (session?.text) return session.text(key)
-  const lang: LocaleKey = 'zh-CN'
-  return locales[lang][key] || key
+  return locales['zh-CN'][key] || key
 }
 
-async function sendTimeout(session: Session, content: MessageKey | any, config: Config) {
-  const text = typeof content === 'string' ? getI18nText(session, content as MessageKey) : content;
-  if (config.imageSendTimeout <= 0) return session.send(text).catch(() => null);
-  return Promise.race([session.send(text), new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), config.imageSendTimeout))]).catch(() => null);
+function clearOldCacheFiles(config: Config): void {
+  if (!fs.existsSync(config.tempDir)) return
+  const now = Date.now()
+  const ageThreshold = config.autoClearCacheInterval > 0
+    ? config.autoClearCacheInterval * 60000
+    : DEFAULT_CACHE_MAX_AGE
+  fs.readdirSync(config.tempDir).forEach(file => {
+    try {
+      const filePath = path.join(config.tempDir, file)
+      const stat = fs.statSync(filePath)
+      if (!stat.isFile()) return
+      if (now - stat.mtimeMs > ageThreshold) fs.unlinkSync(filePath)
+    } catch {}
+  })
 }
 
-function clearAllCache(config: Config) {
-  if (fs.existsSync(config.tempDir)) {
-    fs.readdirSync(config.tempDir).forEach(file => {
-      try {
-        const filePath = path.join(config.tempDir, file);
-        const stat = fs.statSync(filePath);
-        if (Date.now() - stat.mtimeMs > 3600000) fs.unlinkSync(filePath);
-      } catch (error) {}
-    });
+function clearAllCache(config: Config): void {
+  if (!fs.existsSync(config.tempDir)) return
+  fs.readdirSync(config.tempDir).forEach(file => {
+    try {
+      const filePath = path.join(config.tempDir, file)
+      const stat = fs.statSync(filePath)
+      if (stat.isFile()) fs.unlinkSync(filePath)
+    } catch {}
+  })
+}
+
+async function sendTimeout(
+  session: Session,
+  content: string | h,
+  config: Config
+): Promise<void> {
+  if (config.imageSendTimeout <= 0) {
+    await session.send(content).catch(() => {})
+    return
   }
-  return true;
-}
-
-async function fetchImage(url: string, config: Config) {
-  const http = axios.create({ timeout: config.timeout, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' } });
+  let timer: ReturnType<typeof setTimeout> | null = null
   try {
-    if (/^https?:\/\/.+\.(jpg|jpeg|png|gif|webp|bmp)/i.test(url)) return { success: true, type: 'url', data: url, timeout: false };
-    const res = await http.get(url, { responseType: 'arraybuffer' });
-    if (res.status === 200 && res.data) return { success: true, type: 'buffer', data: res.data, timeout: false };
-  } catch (error) {
-    const isTimeout = (error as Error).message.includes('timeout');
-    return { success: false, type: '', data: '', timeout: isTimeout };
+    await Promise.race([
+      session.send(content),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('send_timeout')), config.imageSendTimeout)
+      })
+    ])
+  } catch {
+  } finally {
+    if (timer !== null) clearTimeout(timer)
   }
-  return { success: false, type: '', data: '', timeout: false };
 }
 
-async function fetchHsjpImage(msg: string, msg1: string, msg2: string, config: Config) {
-  const encodedMsg = encodeURIComponent(msg);
-  const encodedMsg1 = encodeURIComponent(msg1);
-  const encodedMsg2 = encodeURIComponent(msg2);
-  const url = `https://api.suyanw.cn/api/hsjp/?msg=${encodedMsg}&msg1=${encodedMsg1}&msg2=${encodedMsg2}`;
-  return fetchImage(url, config);
+let sharedAxios: AxiosInstance | null = null
+
+function getAxios(config: Config): AxiosInstance {
+  if (!sharedAxios) {
+    sharedAxios = axios.create({
+      timeout: config.timeout,
+      headers: { 'User-Agent': USER_AGENT }
+    })
+  }
+  return sharedAxios
 }
 
-async function fetchDmjpImage(text: string, config: Config) {
-  const encodedText = encodeURIComponent(text);
-  const url = `https://api.suyanw.cn/api/dmjp.php?text=${encodedText}`;
-  return fetchImage(url, config);
+async function fetchImage(url: string, config: Config): Promise<FetchResult> {
+  const empty: FetchResult = { success: false, type: '', data: '', timeout: false, networkError: false }
+  if (IMAGE_URL_PATTERN.test(url)) {
+    return { success: true, type: 'url', data: url, timeout: false, networkError: false }
+  }
+  const http = getAxios(config)
+  try {
+    const res = await http.get(url, { responseType: 'arraybuffer' })
+    if (res.status === 200 && res.data) {
+      return { success: true, type: 'buffer', data: res.data, timeout: false, networkError: false }
+    }
+    return empty
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      if (error.code === 'ECONNABORTED') return { ...empty, timeout: true }
+      if (!error.response) return { ...empty, networkError: true }
+    }
+    return empty
+  }
+}
+
+async function fetchHsjpImage(
+  msg: string,
+  msg1: string,
+  msg2: string,
+  config: Config
+): Promise<FetchResult> {
+  const params = [msg, msg1, msg2].map(encodeURIComponent)
+  const url = `${HSJP_API}?msg=${params[0]}&msg1=${params[1]}&msg2=${params[2]}`
+  return fetchImage(url, config)
+}
+
+async function fetchDmjpImage(text: string, config: Config): Promise<FetchResult> {
+  const url = `${DMJP_API}?text=${encodeURIComponent(text)}`
+  return fetchImage(url, config)
+}
+
+function buildImageElement(result: FetchResult): h {
+  if (result.type === 'url') return h.image(result.data as string)
+  const base64 = Buffer.from(result.data as Buffer).toString('base64')
+  return h.image(`data:${FALLBACK_MIME};base64,${base64}`)
+}
+
+function getFailureMessage(result: FetchResult, config: Config): MessageKey | null {
+  if (result.success) return null
+  if (result.timeout && config.showTimeoutTip) return 'messages.fetchTimeout'
+  if (result.networkError) return 'messages.fetchNetworkError'
+  return 'messages.fetchFailed'
+}
+
+async function handleImageCommand(
+  session: Session,
+  config: Config,
+  fetchFn: () => Promise<FetchResult>
+): Promise<void> {
+  const result = await fetchFn()
+  const failMsg = getFailureMessage(result, config)
+  if (failMsg) {
+    await sendTimeout(session, getI18nText(session, failMsg), config)
+    return
+  }
+  const imageElem = buildImageElement(result)
+  if (config.showSuccessTip) {
+    await sendTimeout(session, getI18nText(session, 'messages.fetchSuccess'), config)
+    await delay(SUCCESS_DELAY_MS)
+  }
+  await sendTimeout(session, imageElem, config)
+}
+
+function validateInput(input: string): MessageKey | null {
+  if (!input || input.trim().length === 0) return 'messages.inputError'
+  if (input.length > MAX_INPUT_LENGTH) return 'messages.inputTooLong'
+  return null
 }
 
 export function apply(ctx: Context, config: Config) {
-  if (!isMainThread) return;
-  Object.keys(locales).forEach(lang => { ctx.i18n.define(lang as LocaleKey, locales[lang as LocaleKey]); });
-  clearAllCache(config);
-  ctx.logger.info('[custom-image] 插件已加载');
+  if (!isMainThread) return
 
-  ctx.command('hsjp <msg> [msg1] [msg2]', locales['zh-CN']['commands.hsjp'])
+  Object.keys(locales).forEach(lang => {
+    ctx.i18n.define(lang as LocaleKey, locales[lang as LocaleKey])
+  })
+
+  sharedAxios = axios.create({
+    timeout: config.timeout,
+    headers: { 'User-Agent': USER_AGENT }
+  })
+
+  clearOldCacheFiles(config)
+  ctx.logger.info('[custom-image] 插件已加载')
+
+  ctx
+    .command('hsjp <msg> [msg1] [msg2]', locales['zh-CN']['commands.hsjp'])
     .action(async ({ session }, msg, msg1 = '', msg2 = '') => {
-      if (!config.enable || !config.hsjpEnabled || !session) return;
-      if (!msg || msg.trim().length === 0) { await sendTimeout(session, 'messages.inputError', config); return; }
-      if (config.showWaitingTip) await sendTimeout(session, 'messages.fetchWaiting', config);
-      const result = await fetchHsjpImage(msg, msg1, msg2, config);
-      if (result.timeout && config.showTimeoutTip) { await sendTimeout(session, '图片请求超时，请稍后再试', config); return; }
-      if (result.success) {
-        const imageElem = h.image(result.type === 'url' ? result.data as string : `data:image/jpeg;base64,${Buffer.from(result.data as Buffer).toString('base64')}`);
-        if (config.showSuccessTip) { await sendTimeout(session, 'messages.fetchSuccess', config); await delay(300); }
-        await sendTimeout(session, imageElem, config);
-      } else {
-        await sendTimeout(session, 'messages.fetchFailed', config);
+      if (!config.enable || !config.hsjpEnabled || !session) return
+      const errorKey = validateInput(msg)
+      if (errorKey) {
+        await sendTimeout(session, getI18nText(session, errorKey), config)
+        return
       }
-    });
+      if (config.showWaitingTip) {
+        await sendTimeout(session, getI18nText(session, 'messages.fetchWaiting'), config)
+      }
+      await handleImageCommand(session, config, () => fetchHsjpImage(msg, msg1, msg2, config))
+    })
 
-  ctx.command('dmjp <text>', locales['zh-CN']['commands.dmjp'])
+  ctx
+    .command('dmjp <text>', locales['zh-CN']['commands.dmjp'])
     .action(async ({ session }, text) => {
-      if (!config.enable || !config.dmjpEnabled || !session) return;
-      if (!text || text.trim().length === 0) { await sendTimeout(session, 'messages.inputError', config); return; }
-      if (config.showWaitingTip) await sendTimeout(session, 'messages.fetchWaiting', config);
-      const result = await fetchDmjpImage(text, config);
-      if (result.timeout && config.showTimeoutTip) { await sendTimeout(session, '图片请求超时，请稍后再试', config); return; }
-      if (result.success) {
-        const imageElem = h.image(result.type === 'url' ? result.data as string : `data:image/jpeg;base64,${Buffer.from(result.data as Buffer).toString('base64')}`);
-        if (config.showSuccessTip) { await sendTimeout(session, 'messages.fetchSuccess', config); await delay(300); }
-        await sendTimeout(session, imageElem, config);
-      } else {
-        await sendTimeout(session, 'messages.fetchFailed', config);
+      if (!config.enable || !config.dmjpEnabled || !session) return
+      const errorKey = validateInput(text)
+      if (errorKey) {
+        await sendTimeout(session, getI18nText(session, errorKey), config)
+        return
       }
-    });
+      if (config.showWaitingTip) {
+        await sendTimeout(session, getI18nText(session, 'messages.fetchWaiting'), config)
+      }
+      await handleImageCommand(session, config, () => fetchDmjpImage(text, config))
+    })
 
-  ctx.command('clear-image-cache', locales['zh-CN']['commands.clear-image-cache'])
+  ctx
+    .command('clear-image-cache', locales['zh-CN']['commands.clear-image-cache'])
     .action(({ session }) => {
-      clearAllCache(config);
-      return session ? getI18nText(session, 'messages.cacheCleared') : '✅ 图片缓存已清空';
-    });
+      clearAllCache(config)
+      return getI18nText(session ?? null, 'messages.cacheCleared')
+    })
 
+  let clearTimer: ReturnType<typeof setInterval> | null = null
   if (config.autoClearCacheInterval > 0) {
-    setInterval(() => { clearAllCache(config); ctx.logger.info('[custom-image] 缓存已自动清理'); }, config.autoClearCacheInterval * 60000);
+    clearTimer = setInterval(() => {
+      clearOldCacheFiles(config)
+      ctx.logger.info('[custom-image] 缓存已自动清理')
+    }, config.autoClearCacheInterval * 60000)
   }
 
-  process.on('exit', () => { clearAllCache(config); ctx.logger.info('[custom-image] 插件缓存已清理'); });
+  ctx.on('dispose', () => {
+    if (clearTimer !== null) clearInterval(clearTimer)
+    clearAllCache(config)
+    sharedAxios = null
+    ctx.logger.info('[custom-image] 插件已卸载，缓存已清理')
+  })
 }
 
 export const inject = { optional: ['i18n'] }
