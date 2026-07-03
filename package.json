@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-custom-image-api",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Koishi黑丝/动漫举牌",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -10,22 +10,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc -w",
+    "clean": "rimraf lib",
     "prepack": "npm run build"
-  },
-  "peerDependencies": {
-    "koishi": "^4.0.0"
-  },
-  "dependencies": {
-    "axios": "^1.6.8"
-  },
-  "devDependencies": {
-    "typescript": "^5.3.3",
-    "@types/node": "^20.11.17"
-  },
-  "koishi": {
-    "description": {
-      "zh-CN": "黑丝/动漫举牌"
-    }
   },
   "keywords": [
     "koishi",
@@ -33,10 +19,33 @@
     "image",
     "custom-image",
     "hsjp",
-    "dmjp"
+    "dmjp",
+    "黑丝举牌",
+    "动漫举牌"
   ],
-  "author": "",
+  "author": "Minecraft-1314",
   "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/node": "^20.11.17",
+    "rimraf": "^5.0.5"
+  },
+  "peerDependencies": {
+    "koishi": "^4.0.0",
+    "koishi-plugin-downloads": "^1.0.0",
+    "aria2": "^4.1.2"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-downloads": {
+      "optional": true
+    },
+    "aria2": {
+      "optional": true
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Minecraft-1314/koishi-plugin-custom-image-api.git"
@@ -44,5 +53,13 @@
   "bugs": {
     "url": "https://github.com/Minecraft-1314/koishi-plugin-custom-image-api/issues"
   },
-  "homepage": "https://github.com/Minecraft-1314/koishi-plugin-custom-image-api#readme"
+  "homepage": "https://github.com/Minecraft-1314/koishi-plugin-custom-image-api#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "koishi": {
+    "description": {
+      "zh-CN": "Koishi黑丝/动漫举牌"
+    }
+  }
 }
