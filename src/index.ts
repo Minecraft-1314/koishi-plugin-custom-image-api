@@ -1,11 +1,11 @@
 import { Context, Schema, h, Session } from 'koishi'
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios'
-import fs from 'fs'
+import axios, { AxiosInstance } from 'axios'
 import fsp from 'fs/promises'
 import path from 'path'
 import { pipeline } from 'stream/promises'
 import { createWriteStream } from 'fs'
 import { randomBytes } from 'crypto'
+import { pathToFileURL } from 'url'
 
 declare module 'koishi' {
   interface Context {
@@ -29,6 +29,7 @@ type MessageKey =
   | 'commands.hsjp'
   | 'commands.dmjp'
   | 'commands.clear-image-cache'
+type ImageType = 'hsjp' | 'dmjp'
 
 const DEFAULT_LOCALES: Record<LocaleKey, Record<MessageKey, string>> = {
   'zh-CN': {
@@ -54,6 +55,14 @@ const IMAGE_URL_PATTERN = /^https?:\/\/.+\.(jpg|jpeg|png|gif|webp|bmp)(\?.*)?(#.
 const MAX_INPUT_LENGTH = 200
 const SUCCESS_DELAY_MS = 300
 const FALLBACK_MIME = 'image/jpeg'
+const MAX_DEDUP_ENTRIES = 1024
+const MIME_EXT_MAP: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp'
+}
 
 export const name = 'custom-image-api'
 
@@ -158,6 +167,7 @@ interface FetchResult {
   success: boolean
   type: 'url' | 'buffer' | ''
   data: string | Buffer
+  mime: string
   timeout: boolean
   networkError: boolean
   apiUrl: string
@@ -204,7 +214,7 @@ class ConcurrencyLimiter {
       this.running++
       return
     }
-    return new Promise(resolve => {
+    return new Promise<void>(resolve => {
       this.queue.push(() => {
         this.running++
         resolve()
@@ -219,7 +229,9 @@ class ConcurrencyLimiter {
   }
 }
 
-const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+function delay(ms: number): Promise<void> {
+  return new Promise<void>(resolve => setTimeout(resolve, ms))
+}
 
 let sharedAxios: AxiosInstance | null = null
 let resultCache: SimpleLRUCache<FetchResult> | null = null
@@ -236,7 +248,11 @@ function getAxios(config: Config): AxiosInstance {
   return sharedAxios
 }
 
-function initCacheAndDedup(config: Config) {
+function initState(config: Config): void {
+  sharedAxios = axios.create({
+    timeout: config.timeout,
+    headers: { 'User-Agent': USER_AGENT }
+  })
   resultCache = config.cacheDuration > 0
     ? new SimpleLRUCache<FetchResult>(200, config.cacheDuration * 1000)
     : null
@@ -256,7 +272,7 @@ function getI18nText(session: Session | null, key: MessageKey, config: Config): 
     'messages.inputError': config.inputErrorText,
     'messages.inputTooLong': config.inputTooLongText,
     'messages.cacheCleared': config.cacheClearedText,
-    'messages.repeatRequest': config.repeatRequestText,
+    'messages.repeatRequest': config.repeatRequestText
   }
   const custom = customMap[key]
   if (custom) return custom
@@ -264,45 +280,51 @@ function getI18nText(session: Session | null, key: MessageKey, config: Config): 
   return DEFAULT_LOCALES['zh-CN'][key] || key
 }
 
-function buildApiUrl(type: 'hsjp' | 'dmjp', params: string[]): string {
+function buildApiUrl(type: ImageType, params: string[]): string {
   if (type === 'hsjp') {
     const [msg, msg1, msg2] = params.map(encodeURIComponent)
     return `${HSJP_API}?msg=${msg}&msg1=${msg1}&msg2=${msg2}`
-  } else {
-    const text = encodeURIComponent(params[0])
-    return `${DMJP_API}?text=${text}`
   }
+  const text = encodeURIComponent(params[0])
+  return `${DMJP_API}?text=${text}`
 }
 
-function clearOldCacheFiles(config: Config): void {
-  if (!fs.existsSync(config.tempDir)) return
+async function clearCacheFiles(config: Config, all: boolean): Promise<void> {
+  const dir = path.resolve(config.tempDir)
+  let files: string[]
+  try {
+    files = await fsp.readdir(dir)
+  } catch {
+    return
+  }
+  const prefix = dir + path.sep
+  const threshold = all ? Infinity : (config.autoClearCacheInterval > 0 ? config.autoClearCacheInterval * 60000 : 3600000)
   const now = Date.now()
-  const ageThreshold = config.autoClearCacheInterval > 0
-    ? config.autoClearCacheInterval * 60000
-    : 3600000
-  const resolvedDir = path.resolve(config.tempDir)
-  fs.readdirSync(config.tempDir).forEach(file => {
+  await Promise.all(files.map(async file => {
+    const filePath = prefix + file
+    if (!filePath.startsWith(prefix)) return
     try {
-      const filePath = path.join(config.tempDir, file)
-      if (!filePath.startsWith(resolvedDir + path.sep)) return
-      const stat = fs.statSync(filePath)
+      const stat = await fsp.stat(filePath)
       if (!stat.isFile()) return
-      if (now - stat.mtimeMs > ageThreshold) fs.unlinkSync(filePath)
+      if (all || now - stat.mtimeMs > threshold) await fsp.unlink(filePath)
     } catch {}
-  })
+  }))
 }
 
-function clearAllCache(config: Config): void {
-  if (!fs.existsSync(config.tempDir)) return
-  const resolvedDir = path.resolve(config.tempDir)
-  fs.readdirSync(config.tempDir).forEach(file => {
-    try {
-      const filePath = path.join(config.tempDir, file)
-      if (!filePath.startsWith(resolvedDir + path.sep)) return
-      const stat = fs.statSync(filePath)
-      if (stat.isFile()) fs.unlinkSync(filePath)
-    } catch {}
-  })
+function parseMime(contentType?: string): string {
+  if (!contentType) return FALLBACK_MIME
+  const mime = contentType.split(';')[0].trim().toLowerCase()
+  return mime || FALLBACK_MIME
+}
+
+function sniffImageFormat(data: Buffer): string | null {
+  if (data.length < 12) return null
+  if (data[0] === 0xFF && data[1] === 0xD8) return 'image/jpeg'
+  if (data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4E && data[3] === 0x47) return 'image/png'
+  if (data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x38) return 'image/gif'
+  if (data[0] === 0x42 && data[1] === 0x4D) return 'image/bmp'
+  if (data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  return null
 }
 
 async function fetchImage(url: string, config: Config): Promise<FetchResult> {
@@ -310,18 +332,28 @@ async function fetchImage(url: string, config: Config): Promise<FetchResult> {
     success: false,
     type: '',
     data: '',
+    mime: '',
     timeout: false,
     networkError: false,
     apiUrl: url
   }
   if (IMAGE_URL_PATTERN.test(url)) {
-    return { success: true, type: 'url', data: url, timeout: false, networkError: false, apiUrl: url }
+    return { success: true, type: 'url', data: url, mime: '', timeout: false, networkError: false, apiUrl: url }
   }
-  const http = getAxios(config)
   try {
-    const res = await http.get(url, { responseType: 'arraybuffer' })
-    if (res.status === 200 && res.data) {
-      return { success: true, type: 'buffer', data: res.data, timeout: false, networkError: false, apiUrl: url }
+    const res = await getAxios(config).get(url, { responseType: 'arraybuffer' })
+    if (res.status !== 200 || !res.data) return empty
+    const data = Buffer.from(res.data)
+    const sniffed = sniffImageFormat(data)
+    if (sniffed) {
+      return { success: true, type: 'buffer', data, mime: sniffed, timeout: false, networkError: false, apiUrl: url }
+    }
+    const mime = parseMime(res.headers['content-type'] as string | undefined)
+    if (mime.startsWith('text/')) {
+      const text = data.toString('utf8').trim()
+      if (IMAGE_URL_PATTERN.test(text)) {
+        return { success: true, type: 'url', data: text, mime: '', timeout: false, networkError: false, apiUrl: url }
+      }
     }
     return empty
   } catch (error) {
@@ -333,10 +365,24 @@ async function fetchImage(url: string, config: Config): Promise<FetchResult> {
   }
 }
 
+function extFromMime(mime: string): string {
+  return MIME_EXT_MAP[mime] || 'jpg'
+}
+
+function inferExt(url: string, mime?: string): string {
+  if (mime) {
+    const fromMime = MIME_EXT_MAP[mime]
+    if (fromMime) return fromMime
+  }
+  const match = /\.(jpeg|jpg|png|gif|webp|bmp)(?:[?#].*)?$/i.exec(url)
+  if (!match) return 'jpg'
+  return match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase()
+}
+
 function buildImageElement(result: FetchResult): h {
   if (result.type === 'url') return h.image(result.data as string)
-  const base64 = Buffer.from(result.data as Buffer).toString('base64')
-  return h.image(`data:${FALLBACK_MIME};base64,${base64}`)
+  const data = result.data as Buffer
+  return h.image(`data:${result.mime || FALLBACK_MIME};base64,${data.toString('base64')}`)
 }
 
 function getFailureMessage(result: FetchResult, config: Config): MessageKey | null {
@@ -348,20 +394,13 @@ function getFailureMessage(result: FetchResult, config: Config): MessageKey | nu
 
 async function sendTimeout(session: Session, content: string | h, config: Config): Promise<void> {
   if (config.imageSendTimeout <= 0) {
-    await session.send(content).catch(() => {})
+    await session.send(content)
     return
   }
-  let timer: ReturnType<typeof setTimeout> | null = null
-  try {
-    await Promise.race([
-      session.send(content),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('send_timeout')), config.imageSendTimeout)
-      })
-    ])
-  } catch {} finally {
-    if (timer !== null) clearTimeout(timer)
-  }
+  let sendError: unknown = null
+  const sendPromise = session.send(content).catch((error: unknown) => { sendError = error })
+  await Promise.race([sendPromise, delay(config.imageSendTimeout)])
+  if (sendError !== null) throw sendError
 }
 
 async function sendWithRetry(session: Session, content: string | h, config: Config): Promise<void> {
@@ -370,121 +409,107 @@ async function sendWithRetry(session: Session, content: string | h, config: Conf
     try {
       await sendTimeout(session, content, config)
       return
-    } catch (e) {
-      lastError = e
-      if (attempt < config.retryTimes) {
-        await delay(config.retryInterval)
-      }
+    } catch (error) {
+      lastError = error
+      if (attempt < config.retryTimes) await delay(config.retryInterval)
     }
   }
   if (!config.ignoreSendError) throw lastError
 }
 
-async function downloadFile(
-  url: string,
-  config: Config,
-  ctx: Context,
-  filePrefix: string,
-  fileExts: string[]
-): Promise<string> {
-  await fsp.mkdir(config.tempDir, { recursive: true })
-  const ext = fileExts.find(e => {
-    const r = new RegExp('\\.' + e + '(\\?|$)', 'i')
-    return r.test(url)
-  }) || fileExts[0]
-  const fileName = `${filePrefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
-  const filePath = path.resolve(config.tempDir, fileName)
-
-  if (config.downloadEngine === 'downloads' && ctx.downloads) {
-    try {
-      const dest = await ctx.downloads.download(url, path.join(config.tempDir, fileName), {
-        headers: { 'User-Agent': USER_AGENT },
-        timeout: config.downloadTimeout
-      })
-      const stat = await fsp.stat(dest)
-      if (config.maxMediaSize > 0 && stat.size > config.maxMediaSize * 1024 * 1024) {
-        await fsp.unlink(dest).catch(() => {})
-        throw new Error(`文件过大(${Math.round(stat.size / 1024 / 1024)}MB)，超过限制(${config.maxMediaSize}MB)`)
-      }
-      return dest
-    } catch (e) {}
-  } else if (config.downloadEngine === 'aria2') {
-    let aria2: any
-    try {
-      aria2 = require('aria2')
-    } catch {
-      throw new Error('aria2 模块未安装')
-    }
-    const client = new aria2({
-      host: config.aria2Host,
-      port: config.aria2Port,
-      secure: false,
-      secret: config.aria2Secret,
-      path: '/jsonrpc'
-    })
-    try {
-      await client.open()
-      const gid = await client.call('aria2.addUri', [url], {
-        dir: config.tempDir,
-        out: fileName,
-        split: 4,
-        continue: config.resumeDownload,
-        maxConnectionPerServer: 5,
-        timeout: config.downloadTimeout / 1000,
-        header: [`User-Agent: ${USER_AGENT}`, 'Referer: https://www.baidu.com/']
-      })
-      let completed = false
-      const start = Date.now()
-      while (!completed) {
-        if (Date.now() - start > config.downloadTimeout) {
-          await client.call('aria2.remove', gid).catch(() => {})
-          throw new Error('aria2下载超时')
-        }
-        const status = await client.call('aria2.tellStatus', gid)
-        if (status.status === 'complete') {
-          completed = true
-        } else if (status.status === 'error' || status.status === 'removed') {
-          throw new Error('aria2下载失败')
-        } else {
-          await delay(1000)
-        }
-      }
-    } finally {
-      await client.close().catch(() => {})
-    }
-  } else {
-    const writer = createWriteStream(filePath)
-    let response
-    try {
-      response = await getAxios(config).get(url, {
-        responseType: 'stream',
-        timeout: config.downloadTimeout,
-        headers: { 'User-Agent': USER_AGENT, 'Referer': 'https://www.baidu.com/' },
-        maxRedirects: 5,
-        validateStatus: (status: number) => status >= 200 && status < 300,
-      })
-    } catch (e) {
-      writer.destroy()
-      await fsp.unlink(filePath).catch(() => {})
-      throw e
-    }
-    const contentLength = Number(response.headers['content-length'] || 0)
-    const maxBytes = config.maxMediaSize * 1024 * 1024
-    if (maxBytes > 0 && contentLength > maxBytes) {
-      writer.destroy()
-      await fsp.unlink(filePath).catch(() => {})
-      throw new Error(`文件过大(${Math.round(contentLength / 1024 / 1024)}MB)，超过限制(${config.maxMediaSize}MB)`)
-    }
-    try {
-      await pipeline(response.data, writer)
-    } catch (e) {
-      await fsp.unlink(filePath).catch(() => {})
-      throw e
-    }
+async function downloadWithInternal(url: string, config: Config, prefix: string): Promise<string> {
+  const response = await getAxios(config).get(url, {
+    responseType: 'stream',
+    timeout: config.downloadTimeout,
+    headers: { 'User-Agent': USER_AGENT, 'Referer': 'https://www.baidu.com/' },
+    maxRedirects: 5,
+    validateStatus: (status: number) => status >= 200 && status < 300
+  })
+  const contentLength = Number(response.headers['content-length'] || 0)
+  const maxBytes = config.maxMediaSize * 1024 * 1024
+  if (maxBytes > 0 && contentLength > maxBytes) {
+    response.data.destroy()
+    throw new Error(`文件过大(${Math.round(contentLength / 1024 / 1024)}MB)，超过限制(${config.maxMediaSize}MB)`)
   }
+  const ext = inferExt(url, parseMime(response.headers['content-type'] as string | undefined))
+  const fileName = `${prefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
+  const filePath = path.join(config.tempDir, fileName)
+  try {
+    await pipeline(response.data, createWriteStream(filePath))
+  } catch (error) {
+    await fsp.unlink(filePath).catch(() => {})
+    throw error
+  }
+  return filePath
+}
 
+async function downloadWithDownloads(url: string, config: Config, ctx: Context, prefix: string): Promise<string> {
+  const ext = inferExt(url)
+  const fileName = `${prefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
+  const dest = path.join(config.tempDir, fileName)
+  return ctx.downloads!.download(url, dest, {
+    headers: { 'User-Agent': USER_AGENT },
+    timeout: config.downloadTimeout
+  })
+}
+
+async function downloadWithAria2(url: string, config: Config, prefix: string): Promise<string> {
+  let Aria2: any
+  try {
+    Aria2 = require('aria2')
+  } catch {
+    throw new Error('aria2 模块未安装')
+  }
+  const ext = inferExt(url)
+  const fileName = `${prefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
+  const client = new Aria2({
+    host: config.aria2Host,
+    port: config.aria2Port,
+    secure: false,
+    secret: config.aria2Secret,
+    path: '/jsonrpc'
+  })
+  try {
+    await client.open()
+    const gid = await client.call('aria2.addUri', [url], {
+      dir: config.tempDir,
+      out: fileName,
+      split: 4,
+      continue: config.resumeDownload,
+      maxConnectionPerServer: 5,
+      timeout: Math.max(1, Math.ceil(config.downloadTimeout / 1000)),
+      header: [`User-Agent: ${USER_AGENT}`, 'Referer: https://www.baidu.com/']
+    })
+    const start = Date.now()
+    for (;;) {
+      if (Date.now() - start > config.downloadTimeout) {
+        await client.call('aria2.remove', gid).catch(() => {})
+        throw new Error('aria2下载超时')
+      }
+      const status = await client.call('aria2.tellStatus', gid)
+      if (status.status === 'complete') break
+      if (status.status === 'error' || status.status === 'removed') throw new Error('aria2下载失败')
+      await delay(1000)
+    }
+  } finally {
+    await client.close().catch(() => {})
+  }
+  return path.join(config.tempDir, fileName)
+}
+
+async function downloadFile(url: string, config: Config, ctx: Context, prefix: string): Promise<string> {
+  await fsp.mkdir(config.tempDir, { recursive: true })
+  let filePath: string
+  if (config.downloadEngine === 'downloads' && ctx.downloads) {
+    filePath = await downloadWithDownloads(url, config, ctx, prefix)
+  } else if (config.downloadEngine === 'aria2') {
+    filePath = await downloadWithAria2(url, config, prefix)
+  } else {
+    filePath = await downloadWithInternal(url, config, prefix)
+  }
   const stat = await fsp.stat(filePath)
-  if (config.maxMediaSize > 0 && stat.size > config.maxMediaSize * 1024 * 1024) {
+  const maxBytes = config.maxMediaSize * 1024 * 1024
+  if (maxBytes > 0 && stat.size > maxBytes) {
     await fsp.unlink(filePath).catch(() => {})
     throw new Error(`文件过大(${Math.round(stat.size / 1024 / 1024)}MB)，超过限制(${config.maxMediaSize}MB)`)
   }
@@ -494,31 +519,36 @@ async function downloadFile(
 async function processRequest(
   session: Session,
   config: Config,
-  type: 'hsjp' | 'dmjp',
+  type: ImageType,
   params: string[],
   ctx: Context
 ): Promise<void> {
   const apiUrl = buildApiUrl(type, params)
 
-  if (dedupMap) {
-    const lastTime = dedupMap.get(apiUrl)
-    if (lastTime && Date.now() - lastTime < config.dedupInterval * 1000) {
-      await sendWithRetry(session, getI18nText(session, 'messages.repeatRequest', config), config)
-      return
+  if (dedupMap && config.dedupInterval > 0) {
+    const now = Date.now()
+    const last = dedupMap.get(apiUrl)
+    if (last !== undefined) {
+      if (now - last < config.dedupInterval * 1000) {
+        await sendWithRetry(session, getI18nText(session, 'messages.repeatRequest', config), config)
+        return
+      }
+      dedupMap.delete(apiUrl)
     }
-    dedupMap.set(apiUrl, Date.now())
+    if (dedupMap.size >= MAX_DEDUP_ENTRIES) {
+      for (const [key, time] of dedupMap) {
+        if (now - time >= config.dedupInterval * 1000) dedupMap.delete(key)
+      }
+    }
+    dedupMap.set(apiUrl, now)
   }
 
   let result: FetchResult | undefined
-  if (resultCache) {
-    result = resultCache.get(apiUrl)
-  }
+  if (resultCache) result = resultCache.get(apiUrl)
 
   if (!result) {
     result = await fetchImage(apiUrl, config)
-    if (result.success && resultCache) {
-      resultCache.set(apiUrl, result)
-    }
+    if (result.success && resultCache) resultCache.set(apiUrl, result)
   }
 
   const failMsg = getFailureMessage(result, config)
@@ -529,33 +559,38 @@ async function processRequest(
 
   if (config.imageSendMode === 'link') {
     await sendWithRetry(session, result.apiUrl, config)
-  } else if (config.imageSendMode === 'file') {
+    return
+  }
+
+  if (config.imageSendMode === 'file') {
     if (!downloadLimiter) downloadLimiter = new ConcurrencyLimiter(config.downloadConcurrency)
     await downloadLimiter.acquire()
     try {
       let filePath: string
       if (result.type === 'buffer') {
-        await fsp.mkdir(config.tempDir, { recursive: true })
-        const fileName = `img_${Date.now()}_${randomBytes(4).toString('hex')}.jpg`
+        const ext = extFromMime(result.mime)
+        const fileName = `img_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
         filePath = path.join(config.tempDir, fileName)
+        await fsp.mkdir(config.tempDir, { recursive: true })
         await fsp.writeFile(filePath, result.data as Buffer)
       } else {
-        filePath = await downloadFile(result.data as string, config, ctx, 'img', ['jpg', 'jpeg', 'png', 'gif', 'webp'])
+        filePath = await downloadFile(result.data as string, config, ctx, 'img')
       }
-      await sendWithRetry(session, h.image(`file://${filePath}`), config)
-    } catch (e) {
+      await sendWithRetry(session, h.image(pathToFileURL(filePath).href), config)
+    } catch {
       await sendWithRetry(session, getI18nText(session, 'messages.fetchFailed', config), config)
     } finally {
       downloadLimiter.release()
     }
-  } else {
-    const imageElem = buildImageElement(result)
-    if (config.showSuccessTip) {
-      await sendWithRetry(session, getI18nText(session, 'messages.fetchSuccess', config), config)
-      await delay(SUCCESS_DELAY_MS)
-    }
-    await sendWithRetry(session, imageElem, config)
+    return
   }
+
+  const imageElem = buildImageElement(result)
+  if (config.showSuccessTip) {
+    await sendWithRetry(session, getI18nText(session, 'messages.fetchSuccess', config), config)
+    await delay(SUCCESS_DELAY_MS)
+  }
+  await sendWithRetry(session, imageElem, config)
 }
 
 function validateInput(input: string): MessageKey | null {
@@ -564,68 +599,68 @@ function validateInput(input: string): MessageKey | null {
   return null
 }
 
+async function handleImageCommand(
+  session: Session,
+  config: Config,
+  type: ImageType,
+  params: string[],
+  ctx: Context
+): Promise<void> {
+  const errorKey = validateInput(params[0])
+  if (errorKey) {
+    await sendWithRetry(session, getI18nText(session, errorKey, config), config)
+    return
+  }
+  if (config.showWaitingTip) {
+    await sendWithRetry(session, getI18nText(session, 'messages.fetchWaiting', config), config)
+  }
+  await processRequest(session, config, type, params, ctx)
+}
+
 export function apply(ctx: Context, config: Config) {
-  Object.keys(DEFAULT_LOCALES).forEach(lang => {
-    ctx.i18n.define(lang as LocaleKey, DEFAULT_LOCALES[lang as LocaleKey])
-  })
+  if (ctx.i18n) {
+    Object.keys(DEFAULT_LOCALES).forEach(lang => {
+      ctx.i18n.define(lang as LocaleKey, DEFAULT_LOCALES[lang as LocaleKey])
+    })
+  }
 
-  sharedAxios = axios.create({
-    timeout: config.timeout,
-    headers: { 'User-Agent': USER_AGENT }
-  })
-
-  initCacheAndDedup(config)
-  clearOldCacheFiles(config)
+  initState(config)
+  void clearCacheFiles(config, false)
   ctx.logger.info('[custom-image] 插件已加载')
 
   ctx.command('hsjp <msg> [msg1] [msg2]', DEFAULT_LOCALES['zh-CN']['commands.hsjp'])
     .action(async ({ session }, msg, msg1 = '', msg2 = '') => {
-      if (!config.enable || !config.hsjpEnabled || !session) return
-      const errorKey = validateInput(msg)
-      if (errorKey) {
-        await sendWithRetry(session, getI18nText(session, errorKey, config), config)
-        return
-      }
-      if (config.showWaitingTip) {
-        await sendWithRetry(session, getI18nText(session, 'messages.fetchWaiting', config), config)
-      }
-      await processRequest(session, config, 'hsjp', [msg, msg1, msg2], ctx)
+      if (!session || !config.enable || !config.hsjpEnabled) return
+      await handleImageCommand(session, config, 'hsjp', [msg, msg1, msg2], ctx)
     })
 
   ctx.command('dmjp <text>', DEFAULT_LOCALES['zh-CN']['commands.dmjp'])
     .action(async ({ session }, text) => {
-      if (!config.enable || !config.dmjpEnabled || !session) return
-      const errorKey = validateInput(text)
-      if (errorKey) {
-        await sendWithRetry(session, getI18nText(session, errorKey, config), config)
-        return
-      }
-      if (config.showWaitingTip) {
-        await sendWithRetry(session, getI18nText(session, 'messages.fetchWaiting', config), config)
-      }
-      await processRequest(session, config, 'dmjp', [text], ctx)
+      if (!session || !config.enable || !config.dmjpEnabled) return
+      await handleImageCommand(session, config, 'dmjp', [text], ctx)
     })
 
   ctx.command('clear-image-cache', DEFAULT_LOCALES['zh-CN']['commands.clear-image-cache'])
-    .action(({ session }) => {
-      clearAllCache(config)
+    .action(async ({ session }) => {
+      await clearCacheFiles(config, true)
       return getI18nText(session ?? null, 'messages.cacheCleared', config)
     })
 
   let clearTimer: ReturnType<typeof setInterval> | null = null
   if (config.autoClearCacheInterval > 0) {
     clearTimer = setInterval(() => {
-      clearOldCacheFiles(config)
+      void clearCacheFiles(config, false)
       ctx.logger.info('[custom-image] 缓存已自动清理')
     }, config.autoClearCacheInterval * 60000)
   }
 
   ctx.on('dispose', () => {
     if (clearTimer !== null) clearInterval(clearTimer)
-    clearAllCache(config)
     sharedAxios = null
     resultCache?.clear()
     dedupMap?.clear()
+    downloadLimiter = null
+    void clearCacheFiles(config, true)
     ctx.logger.info('[custom-image] 插件已卸载，缓存已清理')
   })
 }

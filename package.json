@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-custom-image-api",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Koishi黑丝/动漫举牌",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
